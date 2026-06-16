@@ -4,6 +4,8 @@ import dbConnect from "@/lib/db";
 import Booking from "@/models/Booking";
 import { auth } from "@/lib/auth";
 import Stripe from "stripe";
+import { revalidatePath } from "next/cache";
+import { sendCancellationEmail } from "@/lib/email";
 
 // Initialize Stripe (ensure STRIPE_SECRET_KEY is in .env.local)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_placeholder", {
@@ -188,5 +190,115 @@ export async function calculateBookingAmount(venueId: string, bookingType: SlotT
   } catch (error) {
     console.error("Error calculating booking amount:", error);
     return 0;
+  }
+}
+
+export type BookingFilter = "all" | "upcoming" | "past" | "cancelled";
+
+export async function getUserBookings(filter: BookingFilter = "all") {
+  try {
+    const session = await auth();
+    if (!session?.user?.id) return { success: false, error: "Unauthorized", bookings: [] };
+
+    await dbConnect();
+    const now = new Date();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let query: any = { user: session.user.id };
+
+    switch (filter) {
+      case "upcoming":
+        query.eventDate = { $gte: now };
+        query.status = { $in: ["confirmed", "pending"] };
+        break;
+      case "past":
+        query.$or = [
+          { eventDate: { $lt: now }, status: { $ne: "cancelled" } },
+          { status: "completed" },
+        ];
+        break;
+      case "cancelled":
+        query.status = "cancelled";
+        break;
+    }
+
+    const bookings = await Booking.find(query)
+      .sort({ eventDate: -1 })
+      .populate("venue", "name city images")
+      .lean();
+
+    return { success: true, bookings: JSON.parse(JSON.stringify(bookings)) };
+  } catch (error) {
+    console.error("Get user bookings error:", error);
+    return { success: false, error: "Failed to fetch bookings", bookings: [] };
+  }
+}
+
+export async function getBookingById(bookingId: string) {
+  try {
+    const session = await auth();
+    if (!session?.user?.id) return { success: false, error: "Unauthorized" };
+
+    await dbConnect();
+    const booking = await Booking.findById(bookingId)
+      .populate("venue")
+      .lean();
+
+    if (!booking) return { success: false, error: "Booking not found" };
+    if (String(booking.user) !== session.user.id) return { success: false, error: "Forbidden" };
+
+    return { success: true, booking: JSON.parse(JSON.stringify(booking)) };
+  } catch (error) {
+    console.error("Get booking error:", error);
+    return { success: false, error: "Failed to fetch booking" };
+  }
+}
+
+export async function cancelBooking(bookingId: string) {
+  try {
+    const session = await auth();
+    if (!session?.user?.id) return { success: false, error: "Unauthorized" };
+
+    await dbConnect();
+    const booking = await Booking.findById(bookingId).populate("venue");
+
+    if (!booking) return { success: false, error: "Booking not found" };
+    if (String(booking.user) !== session.user.id) return { success: false, error: "Forbidden" };
+
+    if (booking.status === "cancelled") {
+      return { success: false, error: "Booking is already cancelled" };
+    }
+
+    // Enforce 48-hour cancellation policy
+    const eventDate = new Date(booking.eventDate);
+    const now = new Date();
+    const hoursUntilEvent = (eventDate.getTime() - now.getTime()) / (1000 * 60 * 60);
+
+    if (hoursUntilEvent < 48) {
+      return { success: false, error: "Cannot cancel bookings less than 48 hours before the event." };
+    }
+
+    booking.status = "cancelled";
+    await booking.save();
+
+    // Send cancellation email
+    try {
+      const User = (await import("@/models/User")).default;
+      const user = await User.findById(session.user.id);
+      if (user?.email) {
+        await sendCancellationEmail(user.email, booking);
+      }
+    } catch (emailError) {
+      console.error("Cancellation email failed:", emailError);
+      // Don't block the cancellation if email fails
+    }
+
+    revalidatePath("/dashboard/bookings");
+    revalidatePath(`/dashboard/bookings/${bookingId}`);
+
+    return { success: true };
+  } catch (error) {
+    console.error("Cancel booking error:", error);
+    return { success: false, error: "Failed to cancel booking" };
   }
 }
